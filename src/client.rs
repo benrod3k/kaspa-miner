@@ -20,7 +20,7 @@ pub struct KaspadHandler {
     block_template_ctr: u16,
 }
 
-impl KaspadHandler {
+impl<'miner> KaspadHandler {
     pub async fn connect<D>(address: D, miner_address: String, mine_when_not_synced: bool) -> Result<Self, Error>
     where
         D: std::convert::TryInto<tonic::transport::Endpoint>,
@@ -64,7 +64,7 @@ impl KaspadHandler {
         self.client_send(GetBlockTemplateRequestMessage { pay_address }).await
     }
 
-    pub async fn listen(&mut self, miner: &mut MinerManager) -> Result<(), Error> {
+    pub async fn listen(&mut self, miner: &mut MinerManager<'miner>) -> Result<(), Error> {
         while let Some(msg) = self.stream.message().await? {
             match msg.payload {
                 Some(payload) => self.handle_message(payload, miner).await?,
@@ -74,7 +74,7 @@ impl KaspadHandler {
         Ok(())
     }
 
-    async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager) -> Result<(), Error> {
+    async fn handle_message(&mut self, msg: Payload, miner: &mut MinerManager<'miner>) -> Result<(), Error> {
         match msg {
             Payload::BlockAddedNotification(_) => self.client_get_block_template().await?,
             Payload::GetBlockTemplateResponse(template) => match (template.block, template.is_synced, template.error) {

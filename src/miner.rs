@@ -2,6 +2,7 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashMap;
 
 use crate::proto::{KaspadMessage, RpcBlock};
 use crate::{pow, watch, Error};
@@ -16,17 +17,19 @@ use kaspa_miner::{PluginManager, WorkerSpec};
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
 #[allow(dead_code)]
-pub struct MinerManager {
+pub struct MinerManager<'miner> {
     handles: Vec<MinerHandler>,
     block_channel: watch::Sender<Option<pow::State>>,
     send_channel: Sender<KaspadMessage>,
     logger_handle: JoinHandle<()>,
     is_synced: bool,
     hashes_tried: Arc<AtomicU64>,
+    gpus_hashes_tried: &'miner mut HashMap<String, Arc<AtomicU64>>,
+    cpus_hashes_tried: &'miner mut HashMap<String, Arc<AtomicU64>>,
     current_state_id: AtomicUsize,
 }
 
-impl Drop for MinerManager {
+impl<'miner> Drop for MinerManager<'miner> {
     fn drop(&mut self) {
         self.logger_handle.abort();
     }
@@ -40,17 +43,27 @@ pub fn get_num_cpus(n_cpus: Option<u16>) -> u16 {
 
 const LOG_RATE: Duration = Duration::from_secs(10);
 
-impl MinerManager {
+impl<'miner> MinerManager<'miner> {
     pub fn new(send_channel: Sender<KaspadMessage>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
         let hashes_tried = Arc::new(AtomicU64::new(0));
+        let mut gpus_hashes_tried: HashMap<String, Arc<AtomicU64>> = HashMap::new();
+        let mut cpus_hashes_tried: HashMap<String, Arc<AtomicU64>> = HashMap::new();
         let (send, recv) = watch::channel(None);
+ 
         let mut handles =
-            Self::launch_cpu_threads(send_channel.clone(), Arc::clone(&hashes_tried), recv.clone(), n_cpus)
-                .collect::<Vec<MinerHandler>>();
+            Self::launch_cpu_threads(
+                send_channel.clone(),
+                Arc::clone(&hashes_tried),
+                &mut cpus_hashes_tried,
+                recv.clone(),
+                n_cpus
+            ).collect::<Vec<MinerHandler>>();
+
         if manager.has_specs() {
             handles.append(&mut Self::launch_gpu_threads(
                 send_channel.clone(),
                 Arc::clone(&hashes_tried),
+                &mut gpus_hashes_tried,
                 recv,
                 manager,
             ));
@@ -59,9 +72,15 @@ impl MinerManager {
             handles,
             block_channel: send,
             send_channel,
-            logger_handle: task::spawn(Self::log_hashrate(Arc::clone(&hashes_tried))),
+            logger_handle: task::spawn(Self::log_hashrate(
+                Arc::clone(&hashes_tried),
+                &mut cpus_hashes_tried,
+                &mut gpus_hashes_tried,
+            )),
             is_synced: true,
             hashes_tried,
+            cpus_hashes_tried,
+            gpus_hashes_tried,
             current_state_id: AtomicUsize::new(0),
         }
     }
@@ -69,18 +88,27 @@ impl MinerManager {
     fn launch_cpu_threads(
         send_channel: Sender<KaspadMessage>,
         hashes_tried: Arc<AtomicU64>,
+        mut cpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>,
         work_channel: watch::Receiver<Option<pow::State>>,
         n_cpus: Option<u16>,
-    ) -> impl Iterator<Item = MinerHandler> {
+    ) -> impl Iterator<Item = MinerHandler> + '_ {
         let n_cpus = get_num_cpus(n_cpus);
         info!("launching: {} cpu miners", n_cpus);
+
         (0..n_cpus)
-            .map(move |_| Self::launch_cpu_miner(send_channel.clone(), work_channel.clone(), Arc::clone(&hashes_tried)))
+            .map(move |i| Self::launch_cpu_miner(
+                i,
+                send_channel.clone(),
+                work_channel.clone(),
+                Arc::clone(&hashes_tried),
+                &mut cpus_hashes_tried,
+            ))
     }
 
     fn launch_gpu_threads(
         send_channel: Sender<KaspadMessage>,
         hashes_tried: Arc<AtomicU64>,
+        mut gpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>,
         work_channel: watch::Receiver<Option<pow::State>>,
         manager: &PluginManager,
     ) -> Vec<MinerHandler> {
@@ -91,6 +119,7 @@ impl MinerManager {
                 send_channel.clone(),
                 work_channel.clone(),
                 Arc::clone(&hashes_tried),
+                &mut gpus_hashes_tried,
                 spec,
             ));
         }
@@ -123,6 +152,7 @@ impl MinerManager {
         send_channel: Sender<KaspadMessage>,
         mut block_channel: watch::Receiver<Option<pow::State>>,
         hashes_tried: Arc<AtomicU64>,
+        mut gpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>,
         spec: Box<dyn WorkerSpec>,
     ) -> MinerHandler {
         std::thread::spawn(move || {
@@ -131,6 +161,8 @@ impl MinerManager {
             (|| {
                 info!("Spawned Thread for GPU {}", gpu_work.id());
                 let mut nonces = vec![0u64; 1];
+
+                let gpu_hashes_tried = gpus_hashes_tried.entry(gpu_work.id()).or_insert(Arc::new(AtomicU64::new(0)));
 
                 let mut state = None;
 
@@ -162,6 +194,7 @@ impl MinerManager {
                             state = None;
                             nonces[0] = 0;
                             hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
+                            gpu_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
                             continue;
                         } else {
                             let hash = state_ref.calculate_pow(nonces[0]);
@@ -201,6 +234,7 @@ impl MinerManager {
                         }*/
 
                     hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
+                    gpu_hashes_tried.fetch_add(gpu_work.get_workload().try_into().unwrap(), Ordering::AcqRel);
 
                     {
                         if let Some(new_state) = block_channel.get_changed()? {
@@ -219,9 +253,11 @@ impl MinerManager {
 
     #[allow(unreachable_code)]
     pub fn launch_cpu_miner(
+        cpu_id: u16,
         send_channel: Sender<KaspadMessage>,
         mut block_channel: watch::Receiver<Option<pow::State>>,
         hashes_tried: Arc<AtomicU64>,
+        mut cpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>,
     ) -> MinerHandler {
         let mut nonce = Wrapping(thread_rng().next_u64());
         std::thread::spawn(move || {
@@ -245,6 +281,8 @@ impl MinerManager {
                     nonce += Wrapping(1);
                     // TODO: Is this really necessary? can we just use Relaxed?
                     hashes_tried.fetch_add(1, Ordering::AcqRel);
+                    let cpu_hashes_tried = cpus_hashes_tried.entry(cpu_id.to_string()).or_insert(Arc::new(AtomicU64::new(0)));
+                    cpu_hashes_tried.fetch_add(1, Ordering::AcqRel);
 
                     if nonce.0 % 128 == 0 {
                         if let Some(new_state) = block_channel.get_changed()? {
@@ -261,7 +299,10 @@ impl MinerManager {
         })
     }
 
-    async fn log_hashrate(hashes_tried: Arc<AtomicU64>) {
+    async fn log_hashrate(
+        hashes_tried: Arc<AtomicU64>, 
+        cpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>,
+        gpus_hashes_tried: &mut HashMap<String, Arc<AtomicU64>>) {
         let mut ticker = tokio::time::interval(LOG_RATE);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_instant = ticker.tick().await;
@@ -273,8 +314,35 @@ impl MinerManager {
                 warn!("Workers stalled or crashed. Considered reducing workload and check that your node is synced")
             } else if hashes != 0 {
                 let (rate, suffix) = Self::hash_suffix(rate);
-                info!("Current hashrate is: {:.2} {}", rate, suffix);
+                info!("Current total hashrate is: {:.2} {}", rate, suffix);
             }
+
+            info!("CPU hashes tried count {}", cpus_hashes_tried.len());
+
+            for (id, cpu_hashes_tried) in cpus_hashes_tried.iter() {
+                let cpu_hashes = cpu_hashes_tried.swap(0, Ordering::AcqRel);
+                let rate = (cpu_hashes as f64) / (now - last_instant).as_secs_f64();
+                if cpu_hashes == 0 && i % 2 == 0 {
+                    warn!("Workers stalled or crashed. Considered reducing workload and check that your node is synced")
+                } else if cpu_hashes != 0 {
+                    let (rate, suffix) = Self::hash_suffix(rate);
+                    info!("CPU {} hashrate is: {:.2} {}", id, rate, suffix);
+                }
+            }
+
+            info!("GPU hashes tried count {}", gpus_hashes_tried.len());
+
+            for (id, gpu_hashes_tried) in gpus_hashes_tried.iter() {
+                let gpu_hashes = gpu_hashes_tried.swap(0, Ordering::AcqRel);
+                let rate = (gpu_hashes as f64) / (now - last_instant).as_secs_f64();
+                if gpu_hashes == 0 && i % 2 == 0 {
+                    warn!("Workers stalled or crashed. Considered reducing workload and check that your node is synced")
+                } else if gpu_hashes != 0 {
+                    let (rate, suffix) = Self::hash_suffix(rate);
+                    info!("GPU {} hashrate is: {:.2} {}", id, rate, suffix);
+                }
+            }      
+
             last_instant = now;
         }
     }
